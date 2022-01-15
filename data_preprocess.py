@@ -12,11 +12,16 @@ InteractiveShell.ast_node_interactivity = "all"
 
 # In[444]:
 
-
+from tqdm import tqdm
 import pandas as pd
 import numpy as np
-
-
+from itertools import product
+import os
+import sys
+if not os.path.isdir('./checkpoint'):
+    os.mkdir('./checkpoint')
+if not os.path.isdir('./output'):
+    os.mkdir('./output')
 # In[445]:
 
 
@@ -29,8 +34,8 @@ total_num
 total_len
 
 output_size = 56
-
-
+window_len = 56
+interval = 30
 # In[446]:
 
 
@@ -42,7 +47,12 @@ def max_min(x,total_num):
 
     return values,min_val,max_val
 
+def mean_std(x,total_num):
+    mean = x.values.mean(axis=1)
+    std = x.values.std(axis=1)
+    values = (x.values - mean.reshape(total_num,1))/std.reshape(total_num,1)
 
+    return values,mean,std
 # In[447]:
 
 
@@ -50,7 +60,6 @@ def max_min(x,total_num):
 def max_min_reverse(x_numpy,min_val,max_val):
     values = (x_numpy + min_val) * (max_val - min_val)
     return values
-
 
 # In[448]:
 
@@ -73,7 +82,7 @@ data[0,:]
 
 # 划分训练集和验证集
 
-window_len = 56
+
 
 train_series = data[:,0:total_len-output_size]
 train_size = train_series.shape[1]
@@ -99,7 +108,7 @@ x_val_list = []
 x_train_max_val=[]
 x_train_min_val=[]
 for i in range(total_num):
-    for j in range(0,train_size - window_len-output_size,20):
+    for j in range(0,train_size - window_len-output_size,interval):
         x_train = train_series[i,j:j+window_len]
         y_train = train_series[i,j+window_len:j+window_len+output_size]
         x_train_list.append(x_train)
@@ -241,13 +250,13 @@ def initial_weights(model):
 #             [nn.init.orthogonal_(para) for name,para in m.name_parameters() if 'weight' in name]
                 
         if isinstance(m,nn.Linear):
-            nn.init.kaiming_normal_(m.weight.data)
+            nn.init.xavier_uniform_(m.weight.data)
 
 class MLP(nn.Module):
     def __init__(self,input_size,output_size,loss_type=LossFunction.MAE,dropout_rate = 0.2):
         super(MLP, self).__init__()
         self.name = 'MLP'
-        self.loss_type = loss_type
+        self.loss_type_name = loss_type.name
         self.model = nn.Sequential(
             nn.Linear(input_size,256),
             nn.ReLU(),
@@ -289,9 +298,7 @@ class Encoder(nn.Module):
         self.apply(initial_weights)
     
     def forward(self,x):
-        if x.shape[0] != 32 and x.shape[1]!=56:
-            print(x.shape)
-        emb = self.linear(x) # batch size * seq_len
+        emb = self.dropout(self.linear(x)) # batch size * seq_len
         _,(h_n,_) = self.lstm(emb.reshape(x.shape[0],1,self.rnn_input_size))
         
         return h_n
@@ -328,7 +335,7 @@ class Seq2Seq(nn.Module):
     def __init__(self,input_size,output_size,rnn_inpt_size,rnn_hidden_size,loss_type=LossFunction.MAE,dropout_rate=0.2):
         super(Seq2Seq,self).__init__()
         self.name = 'LSTM'
-        self.loss_type = loss_type.name
+        self.loss_type_name = loss_type.name
         self.encoder = Encoder(input_size,rnn_inpt_size,rnn_hidden_size,dropout_rate)
         self.decoder = Decoder(output_size,rnn_hidden_size,rnn_hidden_size,dropout_rate)
 #         self.min = min_val
@@ -368,7 +375,7 @@ from matplotlib import pyplot as plt
 
 
 def smape(y_true, y_pred):
-    return 2.0 * np.mean(np.abs(y_pred - y_true) / (np.abs(y_pred) + np.abs(y_true))) * 100
+    return torch.mean(torch.abs(y_pred - y_true) / (torch.abs((y_pred + y_true)/2))) * 100
 
 
 # In[464]:
@@ -453,11 +460,12 @@ class Trainer:
                 info_str = "train_loss:%.4f val_loss:%.4f train_smape:%.4f val_smape:%.4f\n" % (train_loss, val_loss, epoch_train_smape, epoch_val_smape)
                 print(info_str)
             processbar.update(1)
-        title = 'len_%d + %s + %s + %s'%(window_len,self.best_model.name,self.best_model.loss_type,self.optim_type.name)
+        title = 'len_%d + %s + %s + %s'%(window_len,self.best_model.name,self.best_model.loss_type_name,self.optim_type.name)
         info_str = title + ' ' + info_str
         logging.info(info_str)
         self.draw(train_loss_list,val_loss_list,'epochs','loss',['train_loss','val_loss'],title)
         self.draw(epoch_train_smape_list,epoch_val_smape_list,'epochs','smape',['train_smape','val_smape'],title)
+        return min(train_loss_list),min(val_loss_list),min(epoch_train_smape_list).item(),min(epoch_val_smape_list).item()
         
         
     def draw(self,y1,y2,xlabel,ylabel,legend,title):
@@ -467,7 +475,7 @@ class Trainer:
         plt.ylabel(ylabel)
         plt.legend(legend)
         plt.title(title)
-        plt.savefig("%s.png" % (title +'_'+ ylabel))
+        plt.savefig("./output/%s.png" % (title +'_'+ ylabel))
         plt.show()
         
         
@@ -479,9 +487,8 @@ class Trainer:
             for idx,(x_batch,y_batch,x_max_val,x_min_val) in enumerate(test_loader):
                 x_batch = x_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
-                pred,loss = self.model(x_batch,y_batch)
-                test_loss.append(loss.item())
-            test_loss = sum(test_loss) / len(test_loss)
+                pred,_= self.model(x_batch,y_batch)
+            test_loss = self.loss_function(pred,y_batch,x_min_val,x_max_val)
             test_smape = self.SMAPE(pred,y_batch,x_min_val,x_max_val,Mode.Test)
             test_info = 'test_loss : %.6f test_smape : %.6f' % (test_loss,test_smape)
             logging.info(test_info)
@@ -489,62 +496,103 @@ class Trainer:
 
     
     def SMAPE(self,pred,y_batch,normalize_min_coef,normalize_max_coef,mode=Mode.Trian):
-        pred = max_min_reverse(pred.cpu().detach().numpy(),normalize_min_coef.numpy(),normalize_max_coef.numpy())
+        pred = max_min_reverse(pred.cpu(),normalize_min_coef,normalize_max_coef)
         if mode == Mode.Test:
-            y_batch = y_batch.cpu().detach().numpy().reshape(-1)
+            y_batch = y_batch.cpu()
         else:
-            y_batch = max_min_reverse(y_batch.cpu().detach().numpy(),normalize_min_coef.numpy(),normalize_max_coef.numpy())
+            y_batch = max_min_reverse(y_batch.cpu(),normalize_min_coef,normalize_max_coef)
         smape_val= smape(y_batch.reshape(-1),pred.reshape(-1))
         return smape_val
-        
+
+    def loss_function(self,pred,y_batch,normalize_min_coef,normalize_max_coef):
+        if self.model.loss_type_name == LossFunction.MAE.name:
+            loss_fun = nn.L1Loss()
+        elif self.model.loss_type_name == LossFunction.MSE.name:
+            loss_fun = nn.MSELoss()
+        elif self.model.loss_type_name == LossFunction.SmoothL1.name:
+            loss_fun = nn.SmoothL1Loss()
+        tmp,min,max = y_batch.cpu(), normalize_min_coef, normalize_max_coef
+        values = (tmp - min.reshape(total_num, 1)) / (max - min).reshape(total_num, 1)
+        loss = loss_fun(pred,torch.Tensor(values))
+        return loss
+
     def save_model(self,epoch=None):
         if epoch is not None:
             torch.save(self.best_model,'./checkpoint/len=%d + %s + %s + %s + checkpoint: %d.pt'
-                       %(window_len,self.best_model.name,self.best_model.loss_type,self.optim_type.name,epoch))
+                       %(window_len,self.best_model.name,self.best_model.loss_type_name,self.optim_type.name,epoch))
         torch.save(self.best_model,'./checkpoint/len=%d + %s + %s + %s + test.pt'
-                       %(window_len,self.best_model.name,self.best_model.loss_type,self.optim_type.name))
+                       %(window_len,self.best_model.name,self.best_model.loss_type_name,self.optim_type.name))
 
 
 # In[465]:
 
+if __name__=='__main__':
 
-model_args = {
-    "input_size": window_len,
-    'output_size':output_size,
-    "rnn_inpt_size" : 128,
-    "rnn_hidden_size": 256,
-    "loss_type":LossFunction.MSE,
-    'dropout_rate':0.2,
-    'model_type':ModelType.MLP
-}
+    loss_fun_list = [LossFunction.MAE, LossFunction.MSE, LossFunction.SmoothL1]
+    optim_list = [Optim.SGD, Optim.Adam]
+    combination = product(loss_fun_list,optim_list)
 
-train_args = {
-    'lr' :1e-4,
-    'batch_size' : 32,
-    'dropout_rate' : 0.2,
-    'optim' : Optim.Adam,
-    'epochs' : 10,
-}
+    recoder = pd.DataFrame()
 
-if model_args['model_type'] == ModelType.LSTM:
-    model = Seq2Seq(input_size=model_args["input_size"],output_size=model_args['output_size'],
-                rnn_inpt_size=model_args['rnn_inpt_size'],rnn_hidden_size=model_args['rnn_hidden_size'],
-                loss_type=model_args['loss_type'],dropout_rate=model_args['dropout_rate'])
-elif model_args['model_type'] == ModelType.MLP:
-    model = MLP(model_args["input_size"],model_args['output_size'])
+    best_train_loss_list = []
+    best_valid_loss_list = []
+    best_train_smape_list = []
+    best_valid_smape_list = []
+    best_test_loss_list = []
+    best_test_smape_list = []
 
-trainer = Trainer(model,train_loader,val_loader,test_loader,train_args)
+    for loss_type,optim_type in combination:
+        model_args = {
+            "input_size": window_len,
+            'output_size':output_size,
+            "rnn_inpt_size" : 128,
+            "rnn_hidden_size": 256,
+            "loss_type":loss_type,
+            'dropout_rate':0.2,
+            'model_type':ModelType.LSTM
+        }
+        lr = 6e-3 if optim_type == Optim.SGD else 3e-4
+        train_args = {
+            'lr' :lr,
+            'batch_size' : 32,
+            'dropout_rate' : 0.5,
+            'optim' : optim_type,
+            'epochs' : 50,
+        }
+
+        if model_args['model_type'] == ModelType.LSTM:
+            model = Seq2Seq(input_size=model_args["input_size"],output_size=model_args['output_size'],
+                        rnn_inpt_size=model_args['rnn_inpt_size'],rnn_hidden_size=model_args['rnn_hidden_size'],
+                        loss_type=model_args['loss_type'],dropout_rate=model_args['dropout_rate'])
+        elif model_args['model_type'] == ModelType.MLP:
+            model = MLP(model_args["input_size"],model_args['output_size'])
+
+        trainer = Trainer(model,train_loader,val_loader,test_loader,train_args)
 
 
-# In[466]:
+        # In[466]:
 
+        best_train_loss, best_valid_loss, best_train_smape, best_valid_smape = trainer.train()
+        best_test_loss, best_test_smape = trainer.eval(test_loader)
+        print('test_loss : %.6f test_smape : %.6f' % (best_test_loss,best_test_smape))
 
-from tqdm import tqdm
-trainer.train()
-test_loss,test_smape = trainer.eval(test_loader)
-print('test_loss : %.6f test_smape : %.6f' % (test_loss,test_smape))
+        best_train_loss_list.append(round(best_train_loss,6))
+        best_valid_loss_list.append(round(best_valid_loss,6))
+        best_train_smape_list.append(round(best_train_smape,6))
+        best_valid_smape_list.append(round(best_valid_smape,6))
+        best_test_loss_list.append(round(best_test_loss.item(),6))
+        best_test_smape_list.append(round(best_test_smape.item(),6))
 
-# In[ ]:
+    combination = [(v[0].name,v[1].name) for v in product(loss_fun_list,optim_list)]
+    recoder['combination'] = combination
+    recoder['train_loss'] = best_train_loss_list
+    recoder['train_smape'] = best_valid_loss_list
+    recoder['valid_loss'] = best_train_smape_list
+    recoder['valid_smape'] = best_valid_smape_list
+    recoder['test_loss'] = best_test_loss_list
+    recoder['test_smape'] = best_test_smape_list
+    recoder.to_csv('./output/result.csv')
+        # In[ ]:
 
 
 
