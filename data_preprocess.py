@@ -35,17 +35,17 @@ total_len
 
 output_size = 56
 window_len = 56
-interval = 30
+interval = 20
 # In[446]:
 
 
 # max_min 归一化
-def max_min(x,total_num):
-    min_val = x.values.min(axis=1)
-    max_val = x.values.max(axis=1)
-    values = (x.values - min_val.reshape(total_num,1))/(max_val - min_val).reshape(total_num,1)
-
-    return values,min_val,max_val
+# def max_min(x,total_num):
+#     min_val = x.values.min(axis=1)
+#     max_val = x.values.max(axis=1)
+#     values = (x.values - min_val.reshape(total_num,1))/(max_val - min_val).reshape(total_num,1)
+#
+#     return values,min_val,max_val
 
 def mean_std(x,total_num):
     mean = x.values.mean(axis=1)
@@ -57,17 +57,20 @@ def mean_std(x,total_num):
 
 
 # 最后生成测试数据时进行还原，然后与测试的label进行比较
-def max_min_reverse(x_numpy,min_val,max_val):
-    values = (x_numpy + min_val) * (max_val - min_val)
-    return values
+# def max_min_reverse(x_numpy,mean,std):
+#     values = (x_numpy + min_val) * (max_val - min_val)
+#     return values
 
+def mean_std_reverse(x_numpy,mean,std):
+    values = x_numpy * std + mean
+    return values
 # In[448]:
 
 
 
 # max_min 归一化
-data,min_val,max_val = max_min(data,total_num)
-
+# data,min_val,max_val = max_min(data,total_num)
+data,min_val,max_val = mean_std(data,total_num)
 # data = max_min_reverse(data,min_val,max_val)
 
 
@@ -175,7 +178,7 @@ class MyDataset(Dataset):
 # In[455]:
 
 
-# 封装训练和验证集
+# 封装训练、验证集、测试集
 x_train = dataset['x_train']
 y_train = dataset['y_train']
 x_train_max_val = dataset['x_train_max_val']
@@ -184,7 +187,9 @@ x_val = dataset['x_val']
 y_val = dataset['y_val']
 min_val = dataset['min_val']
 max_val = dataset['max_val']
-    
+x_test = dataset['x_test']
+y_test = pd.read_csv('test.csv',header = None)
+y_test = [y_test.iloc[i,:].to_numpy() for i in range(len(x_test))]
 
 train_dataset = MyDataset(x_train,y_train,x_train_max_val,x_train_min_val)
 val_dataset = MyDataset(x_val,y_val,max_val,min_val)
@@ -193,13 +198,6 @@ train_loader = DataLoader(train_dataset,batch_size = 32,shuffle = True)
 val_loader = DataLoader(val_dataset,batch_size = total_num)
 
 
-# In[456]:
-
-
-# 封装测试集
-x_test = dataset['x_test']
-y_test = pd.read_csv('test.csv',header = None)
-y_test = [y_test.iloc[i,:].to_numpy() for i in range(len(x_test))]
 test_dataset = MyDataset(x_test,y_test,max_val,min_val)
 test_loader = DataLoader(test_dataset,batch_size = total_num)
 
@@ -250,7 +248,7 @@ def initial_weights(model):
 #             [nn.init.orthogonal_(para) for name,para in m.name_parameters() if 'weight' in name]
                 
         if isinstance(m,nn.Linear):
-            nn.init.xavier_uniform_(m.weight.data)
+            nn.init.kaiming_uniform_(m.weight.data)
 
 class MLP(nn.Module):
     def __init__(self,input_size,output_size,loss_type=LossFunction.MAE,dropout_rate = 0.2):
@@ -264,8 +262,10 @@ class MLP(nn.Module):
             nn.Linear(256,256),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256,output_size),
-            nn.ReLU()
+            nn.Linear(256,128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, output_size),
         )
         if loss_type == LossFunction.MAE:
             self.loss_fun = nn.L1Loss()
@@ -496,11 +496,11 @@ class Trainer:
 
     
     def SMAPE(self,pred,y_batch,normalize_min_coef,normalize_max_coef,mode=Mode.Trian):
-        pred = max_min_reverse(pred.cpu(),normalize_min_coef,normalize_max_coef)
+        pred = mean_std_reverse(pred.cpu(),normalize_min_coef,normalize_max_coef)
         if mode == Mode.Test:
             y_batch = y_batch.cpu()
         else:
-            y_batch = max_min_reverse(y_batch.cpu(),normalize_min_coef,normalize_max_coef)
+            y_batch = mean_std_reverse(y_batch.cpu(),normalize_min_coef,normalize_max_coef)
         smape_val= smape(y_batch.reshape(-1),pred.reshape(-1))
         return smape_val
 
@@ -512,7 +512,8 @@ class Trainer:
         elif self.model.loss_type_name == LossFunction.SmoothL1.name:
             loss_fun = nn.SmoothL1Loss()
         tmp,min,max = y_batch.cpu(), normalize_min_coef, normalize_max_coef
-        values = (tmp - min.reshape(total_num, 1)) / (max - min).reshape(total_num, 1)
+        # values = (tmp - min.reshape(total_num, 1)) / (max - min).reshape(total_num, 1)
+        values = (tmp - min.reshape(total_num, 1)) / max.reshape(total_num, 1)
         loss = loss_fun(pred,torch.Tensor(values))
         return loss
 
@@ -549,15 +550,15 @@ if __name__=='__main__':
             "rnn_hidden_size": 256,
             "loss_type":loss_type,
             'dropout_rate':0.2,
-            'model_type':ModelType.LSTM
+            'model_type':ModelType.MLP
         }
-        lr = 6e-3 if optim_type == Optim.SGD else 3e-4
+        lr = 0.1 if optim_type == Optim.SGD else 1e-4
         train_args = {
             'lr' :lr,
             'batch_size' : 32,
             'dropout_rate' : 0.5,
             'optim' : optim_type,
-            'epochs' : 50,
+            'epochs' : 100,
         }
 
         if model_args['model_type'] == ModelType.LSTM:
@@ -591,7 +592,7 @@ if __name__=='__main__':
     recoder['valid_smape'] = best_valid_smape_list
     recoder['test_loss'] = best_test_loss_list
     recoder['test_smape'] = best_test_smape_list
-    recoder.to_csv('./output/result.csv')
+    recoder.to_csv('./output/result_%d.csv' % (window_len))
         # In[ ]:
 
 
